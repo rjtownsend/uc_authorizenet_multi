@@ -1,0 +1,513 @@
+<?php
+// Id: uc_authorizenet_multi_multi.module
+
+/**
+ * Allows you to choose a payment profile on a per-product basis.
+ * Stores profile data using variable_set with the profile id appended to the var name
+ *
+ * uc_authnet_multi_profile_name_{profile_id}
+ * uc_authnet_multi_api_login_id_{profile_id}
+ * uc_authnet_multi_api_transaction_key_{profile_id}
+ * uc_authnet_multi_aim_txn_mode_{profile_id}
+ * uc_authnet_multi_aim_email_customer_{profile_id}
+ * uc_authnet_multi_response_debug_{profile_id}
+ *
+ *
+ */
+
+
+/**
+ * Implementation of hook_menu().
+ */
+function uc_authorizenet_multi_menu() {
+  $items = array();
+
+  $items['authnetmulti/profile-edit/%'] = array(
+    'title' => 'Update payment profile details',
+    'description' => 'Update the payment details for a payment profile.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('uc_authorizenet_multi_profile_edit_form', 2),
+    'access callback' => 'uc_authorizenet_multi_profile_edit_access',
+    'type' => MENU_CALLBACK,
+    'file' => 'uc_authorizenet_multi.pages.inc',
+  );
+
+
+  return $items;
+}
+
+// For testing, make sure everybody has access
+function uc_authorizenet_multi_profile_edit_access() {
+  return TRUE;
+}
+
+/**
+ * Implementation of hook_payment_gateway().
+ */
+function uc_authorizenet_multi_payment_gateway() {
+  $gateways[] = array(
+    'id' => 'authorizenetmulti',
+    'title' => t('Authorize.net Multi'),
+    'description' => t('Process credit card payments using a gateway selected on a per product basis.'),
+    'settings' => 'uc_authorizenet_multi_settings_form',
+    'credit' => 'uc_authorizenet_multi_charge',
+    'credit_txn_types' => array( UC_CREDIT_AUTH_CAPTURE),
+  );
+
+  return $gateways;
+}
+
+function _uc_authorizenet_multi_get_profile_count() {
+  return max(1, (int)variable_get('uc_authnet_multi_profile_count', 1));
+}
+
+/**
+ * Callback for payment gateway settings.
+ */
+function uc_authorizenet_multi_settings_form() {
+  $login_data = _uc_authorizenet_login_data();
+  
+  $form['api_id_key'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('API Login ID and Transaction Key'),
+    '#description' => t('This information is required for Ubercart to interact with your payment gateway account.  It is different from your login ID and password and may be found through your account settings page.'),
+  );
+  
+  $profile_count = _uc_authorizenet_multi_get_profile_count();
+  $form['api_id_key']['uc_authnet_multi_profile_count'] = array(
+    '#type' => 'textfield',
+    '#size' => 4,
+    '#title' => t('How many profiles would you like to use?'),
+    '#default_value' => $profile_count,
+    '#description' => t('Enter how many profiles you would like to use, then click save and you\'ll be able to customize the profiles below.'),
+  );
+  $gateways_html .= '<div style="float:left;clear:both; width: 30%;"><strong>Profile Name</strong></div>';
+  $gateways_html .= '<div style="float:left;width: 20%;"><strong>Mode</strong></div>';
+  for ($i=1; $i<=$profile_count; $i++) {
+    $title = variable_get('uc_authnet_multi_profile_name_' . $i, 'Unnamed ' . $i);
+    if (empty($title)) $title = 'Unnamed';
+    $mode = variable_get('uc_authnet_multi_aim_txn_mode_' . $i, 'live_test');
+    $gateways_html .= '<div style="float:left;clear:both; width: 30%;">' . l($title, 'authnetmulti/profile-edit/' . $i) . '</div>';
+    $gateways_html .= '<div style="float:left;width: 20%;">' . $mode . '</div>';
+  }
+  $gateways_html .= '<div style="clear:both;"></div>';
+  $form['api_id_key']['uc_authnet_profile_name'] = array(
+    '#value' => $gateways_html,
+  );
+  
+  return $form;
+}
+
+
+// Main handler for processing credit card transactions.
+function uc_authorizenet_multi_charge($order_id, $amount, $data) {
+  // Load the order.
+  $order = uc_order_load($order_id);
+
+  // Perform the appropriate action based on the transaction type.
+  switch ($data['txn_type']) {
+    // Reference transactions are handled through Authorize.Net's CIM.
+    case UC_CREDIT_REFERENCE_TXN:
+      return _uc_authorizenet_multi_cim_profile_charge($order, $amount, $data);
+
+    // Set a reference only.
+    case UC_CREDIT_REFERENCE_SET:
+      // Return the error message if this failed.
+      if ($message = _uc_authorizenet_multi_cim_profile_create($order)) {
+        return array('success' => FALSE, 'message' => $message);
+      }
+      else {
+        return array('success' => TRUE, 'message' => t('New customer profile created successfully at Authorize.Net.'));
+      }
+
+    // Accommodate all other transaction types.
+    default:
+      return _uc_authorizenet_multi_charge_split($order, $amount, $data);
+  }
+}
+
+/**
+ * Handles authorizations and captures through AIM at Authorize.Net
+ */
+function _uc_authorizenet_multi_charge_split($order, $amount, $data) {
+  global $user;
+  
+  $suborder_products = array();
+  $suborder_item_count = array();
+  $suborder_totals = array();
+
+  // Build a description of the order for logging in Auth.Net.
+  $description = array();
+  
+  // Pull the line item amount.
+  // There may be multiple line donation amounts, so pull the last one
+  foreach ($order->line_items as $line_item) {
+    if($line_item['type'] == 'subtotal2') {
+      $line = $line_item['amount'];  
+    }
+  }
+  
+  // here we're going to split up the products into subproduct arrays
+  foreach ((array) $order->products as $product) {
+    $prod_node = node_load($product->nid);
+    $payment_profile_id = (int)$prod_node->profile_id;
+    $suborder_products[$payment_profile_id][] = $product;
+    if($prod_node->type == 'spc') {
+      $suborder_totals[$payment_profile_id] += ($line + ($product->price * $product->qty));
+    }
+    else { 
+      $suborder_totals[$payment_profile_id] += ($product->price * $product->qty);
+    }
+    $suborder_item_count[$payment_profile_id] += $product->qty;
+  }
+  
+  $results = array();
+  $amounts_message = array();
+  //$success = false; // set it to false until at least one succeeds
+  //$result_messages = '';
+  
+  $profile_count = _uc_authorizenet_multi_get_profile_count();
+  for ($i=1; $i<=$profile_count; $i++) {
+    // loop through the available profiles
+    if (isset($suborder_totals[$i])) {
+      if ($suborder_totals[$i] > 0) {
+        // this is an order and it has a positive dollar value
+        $suborder = $order; // make a copy of the original order
+        $suborder->products = (array)$suborder_products[$i];
+        $suborder->order_total = $suborder_totals[$i];
+        $suborder->product_count = $suborder_item_count[$i];
+        // the line below updates the "Line_item" order property
+        $suborder->line_items[0]['amount'] = $suborder_totals[$i];
+        
+        // get and format the prices for the message below
+        $options = array();
+        $handlers = _uc_price_get_handlers($options);
+        $options += $handlers['options'];
+        $amounts_message[] = $handlers['formatter']($suborder_totals[$i], $options);
+        
+        
+        $results[] = array('profile_id' => $i, 'result' => _uc_authorizenet_multi_charge($suborder, $suborder_totals[$i], $data, $i));
+      }
+    }
+  }
+  
+  // now, write all of the results to the Payments log
+  // later, we'll return a result with log_payment = false so the payment module
+  // doesn't double-write them to the db.
+  $customer_id = 0;
+  for ($i = 0; $i < count($results); $i++) {
+    $result_data = $results[$i];
+    $profile_id = $result_data['profile_id'];
+    $result = $result_data['result'];
+    // add the payment profile_id number 
+    // and the payment profile_name to this array
+    $result['data']['profile_id'] = $profile_id;
+    
+    $customer_id = (empty($result['uid'])) ? 0 : $result['uid'];
+    if ($result['log_payment'] !== FALSE) {
+      uc_payment_enter($order->order_id, $order->payment_method, $suborder_totals[$profile_id], $customer_id, $result['data'], $result['comment']);
+    }
+  }
+  
+  if (count($results) > 1 && $customer_id > 0) {
+    // they're being charged by multiple gateways, so leave a comment on the order
+    uc_order_comment_save($order->order_id, $customer_id, "You will see " . count($results) . " entries on your credit card statement in the amounts of " . implode(', ', $amounts_message), 'order', '-');
+  }
+  
+  // now return the last one back to the calling function
+  $result_data = $results[count($results)-1]; // grabs the last item in the array
+  $result = $result_data['result']; // gets the "results" part of the array
+  $result['log_payment'] = FALSE; // set it to false so it doesn't log it.
+  return $result;
+}
+
+/**
+ * Handles authorizations and captures through AIM at Authorize.Net
+ * This is a replica of the function _uc_authorizenet_charge from the
+ * Authorize.net payment module with the addition of the $profile_id param
+ * Using that param, we'll load the profile id from the variables and charge to that gateway
+ */
+function _uc_authorizenet_multi_charge($order, $amount, $data, $profile_id) {
+  global $user;
+  
+  // Build a description of the order for logging in Auth.Net.
+  $description = array();
+  foreach ((array) $order->products as $product) {
+    $description[] = $product->qty .'x '. $product->model;
+  }
+
+  $billing_country = uc_get_country_data(array('country_id' => $order->billing_country));
+  $delivery_country = uc_get_country_data(array('country_id' => $order->delivery_country));
+
+  $context = array(
+    'revision' => 'formatted-original',
+    'type' => 'amount',
+  );
+  $options = array(
+    'sign' => FALSE,
+    'thou' => FALSE,
+    'dec' => '.',
+  );
+
+  // Build the POST data for the transaction.
+  $submit_data = array(
+    // Merchant Information
+    'x_login' => variable_get('uc_authnet_multi_api_login_id_' . $profile_id, ''),
+    'x_tran_key' => variable_get('uc_authnet_multi_api_transaction_key_' . $profile_id, ''),
+
+    // Transaction Information
+    'x_version' => '3.1',
+    'x_type' => _uc_authorizenet_txn_map($data['txn_type']),
+    // 'x_method' => $order->payment_method == 'credit' ? 'CC' : 'ECHECK',
+    'x_method' => 'CC',
+    // 'x_recurring_billing' => 'FALSE',
+    'x_amount' => uc_price($amount, $context, $options),
+    'x_card_num' => $order->payment_details['cc_number'],
+    'x_exp_date' => $order->payment_details['cc_exp_month'] . '/' . $order->payment_details['cc_exp_year'],
+    'x_card_code' => $order->payment_details['cc_cvv'],
+    // 'x_trans_id' => '',
+    // 'x_auth_code' => '',
+    'x_test_request' => variable_get('uc_authnet_multi_aim_txn_mode_' . $profile_id, 'live_test') == 'live_test' ? 'TRUE' : 'FALSE',
+    // 'x_duplicate_window' => '120',
+
+    // Order Information
+    'x_invoice_num' => $order->order_id,
+    'x_description' => substr(implode(', ', $description), 0, 255),
+
+    // Customer Information
+    'x_first_name' => substr($order->billing_first_name, 0, 50),
+    'x_last_name' => substr($order->billing_last_name, 0, 50),
+    'x_company' => substr($order->billing_company, 0, 50),
+    'x_address' => substr($order->billing_street1, 0, 60),
+    'x_city' => substr($order->billing_city, 0, 40),
+    'x_state' => substr(uc_get_zone_code($order->billing_zone), 0, 40),
+    'x_zip' => substr($order->billing_postal_code, 0, 20),
+    'x_country' => !$billing_country ? '' : $billing_country[0]['country_iso_code_2'],
+    'x_phone' => substr($order->billing_phone, 0, 25),
+    // 'x_fax' => substr('', 0, 25),
+    'x_email' => substr($order->primary_email, 0, 255),
+    'x_cust_id' => substr($order->uid, 0, 20),
+    'x_customer_ip' => substr(ip_address(), 0, 15),
+
+    // Shipping Information
+    'x_ship_to_first_name' => substr($order->delivery_first_name, 0, 50),
+    'x_ship_to_last_name' => substr($order->delivery_last_name, 0, 50),
+    'x_ship_to_company' => substr($order->delivery_company, 0, 50),
+    'x_ship_to_address' => substr($order->delivery_street1, 0, 60),
+    'x_ship_to_city' => substr($order->delivery_city, 0, 40),
+    'x_ship_to_state' => substr(uc_get_zone_code($order->delivery_zone), 0, 40),
+    'x_ship_to_zip' => substr($order->delivery_postal_code, 0, 20),
+    'x_ship_to_country' => !$delivery_country ? '' : $delivery_country[0]['country_iso_code_2'],
+
+    // Extra Information
+    'x_delim_data' => 'TRUE',
+    'x_delim_char' => '|',
+    'x_encap_char' => '"',
+    'x_relay_response' => 'FALSE',
+    'x_email_customer' => variable_get('uc_authnet_multi_aim_email_customer_' . $profile_id, FALSE) ? 'TRUE' : 'FALSE',
+  );
+
+  if ($data['txn_type'] == UC_CREDIT_PRIOR_AUTH_CAPTURE) {
+    $submit_data['x_trans_id'] = $data['auth_id'];
+  }
+
+  // Determine the correct URL based on the transaction mode.
+  if (variable_get('uc_authnet_multi_aim_txn_mode_' . $profile_id, 'live_test') == 'developer_test') {
+    $post_url = 'https://test.authorize.net/gateway/transact.dll';
+  }
+  else {
+    $post_url = 'https://secure.authorize.net/gateway/transact.dll';
+  }
+
+  // Translate the data array into a string we can POST.
+  $post_fields = array();
+  foreach ($submit_data as $key => $value) {
+    $post_fields[] = $key . '=' . urlencode($value);
+  }
+
+  // Setup the cURL request.
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_URL, $post_url);
+  curl_setopt($ch, CURLOPT_VERBOSE, 0);
+  curl_setopt($ch, CURLOPT_POST, 1);
+  curl_setopt($ch, CURLOPT_POSTFIELDS, implode('&', $post_fields));
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+  curl_setopt($ch, CURLOPT_NOPROGRESS, 1);
+  curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 0);
+  $result = curl_exec($ch);
+
+  // Log any errors to the watchdog.
+  if ($error = curl_error($ch)) {
+    watchdog('uc_authorizenet', 'cURL error: @error', array('@error' => $error), WATCHDOG_ERROR);
+    return array('success' => FALSE);
+  }
+  curl_close($ch);
+
+  $response = explode('|', $result);
+
+  if (variable_get('uc_authnet_multi_response_debug_' . $profile_id, FALSE)) {
+    watchdog('uc_authorizenet', 'Debug response: !data', array('!data' => '<pre>' . check_plain(print_r($response, TRUE)) . '</pre>'));
+  }
+
+  // Trim off the encapsulating character from the results.
+  for ($i = 0; $i < count($response); $i++) {
+    $response[$i] = substr($response[$i], 1, strlen($response[$i]) - 2);
+  }
+
+  /**
+   * Response key index:
+   * 0 = Response Code
+   * 2 = Response Reason Code
+   * 3 = Response Reason Text
+   * 4 = Authorization Code
+   * 5 = Address Verification Service (AVS) Response
+   * 6 = Transaction ID; needed for CREDIT, PRIOR_AUTH_CAPTURE, and VOID transactions.
+   * 9 = Amount
+   * 11 = Transaction Type
+   * 32 = Tax Amount Charged
+   * 37 = Transaction Response MD5 Hash
+   * 38 = Card Code (CVV) Response
+   */
+
+  // If we didn't get an approval response code...
+  if ($response[0] != '1') {
+    // Fail the charge with the reason text in the decline message.
+    $result = array(
+      'success' => FALSE,
+      'message' => t('Credit card payment declined: @message', array('@message' => $response[3])),
+      'uid' => $user->uid,
+    );
+  }
+  else {
+    // Build a message for display and comments in the payments table.
+    $message = t('Type: @type<br />ID: @id', array('@type' => _uc_authorizenet_txn_type($response[11]), '@id' => $response[6]));
+    $result = array(
+      'success' => TRUE,
+      'comment' => $message,
+      'message' => $message,
+      'data' => array('module' => 'uc_authorizenet', 'txn_type' => $response[11], 'txn_id' => $response[6]),
+      'uid' => $user->uid,
+    );
+
+    // If this was an authorization only transaction...
+    if ($data['txn_type'] == UC_CREDIT_AUTH_ONLY) {
+      // Log the authorization to the order.
+      uc_credit_log_authorization($order->order_id, $response[6], $amount);
+    }
+    elseif ($data['txn_type'] == UC_CREDIT_PRIOR_AUTH_CAPTURE) {
+      uc_credit_log_prior_auth_capture($order->order_id, $data['auth_id']);
+    }
+
+    // Create a transaction reference if specified in the payment gateway
+    // settings and this is an appropriate transaction type.
+    if (variable_get('uc_authnet_multi_cim_profile_' . $profile_id, FALSE) && in_array($data['txn_type'], array(UC_CREDIT_AUTH_ONLY, UC_CREDIT_AUTH_CAPTURE))) {
+      // Ignore the returned message for now; that will appear in the comments.
+      _uc_authorizenet_cim_profile_create($order);
+    }
+  }
+
+  // Don't log this as a payment money wasn't actually captured.
+  if (in_array($data['txn_type'], array(UC_CREDIT_AUTH_ONLY))) {
+    $result['log_payment'] = FALSE;
+  }
+
+  // Build an admin order comment.
+  $context = array(
+    'revision' => 'formatted-original',
+    'type' => 'amount',
+  );
+  $comment = t('<b>@type</b><br /><b>@status:</b> @message<br />Amount: @amount<br />AVS response: @avs',
+    array('@type' => _uc_authorizenet_txn_type($response[11]), '@status' => $result['success'] ? t('ACCEPTED') : t('REJECTED'), '@message' => $response[3], '@amount' => uc_price($response[9], $context), '@avs' => _uc_authorizenet_avs($response[5])));
+
+  // Add the CVV response if enabled.
+  if (variable_get('uc_credit_cvv_enabled', TRUE)) {
+    $comment .= '<br />'. t('CVV match: @cvv', array('@cvv' => _uc_authorizenet_cvv($response[38])));
+  }
+
+  // Save the comment to the order.
+  uc_order_comment_save($order->order_id, $user->uid, $comment, 'admin');
+  
+  
+  // This comment is used for the services export module
+  //uc_order_comment_save($order->order_id, $user->uid, $comment, 'admin');
+
+  return $result;
+}
+
+function _uc_authorizenet_multi_get_profiles() {
+  
+  $profile_count = _uc_authorizenet_multi_get_profile_count();
+  $profiles = array();
+  for ($i=1; $i<=$profile_count; $i++) {
+    $profiles['' . $i] = variable_get('uc_authnet_multi_profile_name_' . $i, 'Profile ' . $i);
+  }
+  return $profiles;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * 
+These are the form altering functions so we can have a drop down
+listing the available payment options on the node form.
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+function uc_authorizenet_multi_form_alter(&$form, $form_state, $form_id) {
+  // this makes sure we don't alter non product forms
+  if (uc_product_is_product_form($form)) {
+    //print_r($form);
+    
+    $default_value = 1;
+    $this_nid = $form_state['args'][0]->nid;
+    if (empty($this_nid)) $this_nid = $form['nid']['#value'];
+    if ($this_nid > 0) {
+      // load the setting
+      $q = db_query("SELECT nid,profile_id FROM {uc_authorizenet_multi} WHERE nid='%d'", $this_nid);
+      if ($r = db_fetch_array($q)) {
+        $default_value = $r['profile_id'];
+      }
+    }
+    
+    // add our field to the form
+    $form['base']['payment_gateway_profile'] = array(
+      '#type' => 'select', 
+      '#title' => t('Payment Gateway Profile'), 
+      '#default_value' => $default_value,
+      '#options' => _uc_authorizenet_multi_get_profiles(),
+      '#description' => t('Choose the payment profile that will be used when a customer purchases this product.'),
+    );
+    
+    // set up the function to be called on validation
+    $form['#validate'][] = 'uc_authorizenet_multi_payment_profile_validate';
+    
+  }
+}
+
+function uc_authorizenet_multi_payment_profile_validate($form, &$form_state) {
+   //Validation stuff here, set $error to true if something went wrong, or however u want to do this.  Completely up to u in how u set errors.
+   if (!(int)$form_state['values']['payment_gateway_profile']) {
+      form_set_error('payment_gateway_profile', 'The payment profile selected is invalid');
+   }
+}
+
+function uc_authorizenet_multi_nodeapi(&$node, $op, $a3 = NULL, $a4 = NULL) {
+  if (uc_product_is_product($node)) {
+    switch ($op) {
+    case 'load':
+      // Add to node object
+      $result = db_query("SELECT nid,profile_id FROM {uc_authorizenet_multi} WHERE nid='%d'", $node->nid);
+      
+      if ($row = db_fetch_object($result)) {
+        $node->profile_id = $row->profile_id;
+      }
+    break;
+    case 'insert':
+    case 'update':
+      // grab the selected profile id from the form
+      $profile_id = $node->payment_gateway_profile;
+      
+      // update the reference in our database
+      db_query("REPLACE INTO {uc_authorizenet_multi} (nid, profile_id) VALUES ('%d', '%d')", $node->nid,  $profile_id);
+      
+    break;
+    }
+  }
+}
+

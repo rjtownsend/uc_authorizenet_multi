@@ -1,0 +1,7 @@
+name = Authorize.net Multi Payment
+description = Allows you to choose a payment profile on a per-product basis.
+dependencies[] = uc_payment
+dependencies[] = uc_credit
+dependencies[] = uc_authorizenet
+package = Ubercart - payment
+core = 6.x

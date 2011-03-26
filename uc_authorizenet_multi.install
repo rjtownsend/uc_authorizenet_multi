@@ -1,0 +1,45 @@
+<?php
+
+/**
+ * @file
+ * Install hooks for uc_authorizenet_multi.module
+ */
+function uc_authorizenet_multi_schema() {
+  $schema['uc_authorizenet_multi'] = array(
+	'description' => t('A table that stores node to payment profile references'),
+	'fields' => array(
+	  'nid' => array(
+		'description' => t('The node id of the referenced node'),
+		'type' => 'int',
+		'unsigned' => TRUE,
+		'not null' => TRUE,
+	  ),
+	    'profile_id' => array(
+		  'description' => t('The profile id of the referenced profile'),
+		  'type' => 'int',
+		  'unsigned' => TRUE,
+		  'not null' => TRUE,
+		),
+	  ),
+	  'primary key' => array('nid'),
+	);
+  return $schema;
+}
+
+
+
+/**
+ * Implementation of hook_install().
+ */
+function uc_authorizenet_multi_install() {
+  // Create the table.
+  drupal_install_schema('uc_authorizenet_multi');
+}
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function uc_authorizenet_multi_uninstall() {
+  // Drop the table.
+  drupal_uninstall_schema('uc_authorizenet_multi');
+}
