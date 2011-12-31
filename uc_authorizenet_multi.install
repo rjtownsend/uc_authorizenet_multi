@@ -10,7 +10,7 @@ function uc_authorizenet_multi_requirements($phase) {
   }
 }
 
-function uc_authorizenet_multi_requirements() {
+function _uc_authorizenet_multi_requirements_runtime() {
 /**
  * Determine requirements.
  *
