@@ -1,7 +1,39 @@
 <?php
 
 /**
- * @file
+ * Implementation of hook_requirements().
+ */
+function uc_authorizenet_multi_requirements($phase) {
+  switch ($phase) {
+    case 'runtime':
+      return _uc_authorizenet_multi_requirements_runtime();
+  }
+}
+
+function uc_authorizenet_multi_requirements() {
+/**
+ * Determine requirements.
+ *
+ * @return
+ *   An array of requirements and related states.
+ */
+function _uc_authorizenet_multi_requirements_runtime() {
+  $requirements = array(
+    'curl' => array(
+      'title' => t('Server supports PHP cURL'),
+      'value' => t('Installed'),
+    ),
+  );
+  // Ensure curl is installed.
+  if (!in_array('curl', get_loaded_extensions())) {
+    $requirements['curl']['description'] = t('The module requires PHP cURL is installed.');
+    $requirements['curl']['value'] = t('Not installed');
+    $requirements['curl']['severity'] = REQUIREMENT_ERROR;
+  }
+  return $requirements;
+}
+
+/**
  * Install hooks for uc_authorizenet_multi.module
  */
 function uc_authorizenet_multi_schema() {
@@ -25,8 +57,6 @@ function uc_authorizenet_multi_schema() {
 	);
   return $schema;
 }
-
-
 
 /**
  * Implementation of hook_install().

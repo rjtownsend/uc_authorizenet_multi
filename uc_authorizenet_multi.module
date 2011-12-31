@@ -36,11 +36,6 @@ function uc_authorizenet_multi_menu() {
   return $items;
 }
 
-// For testing, make sure everybody has access
-function uc_authorizenet_multi_profile_edit_access() {
-  return TRUE;
-}
-
 /**
  * Implementation of hook_payment_gateway().
  */
@@ -492,7 +487,7 @@ function uc_authorizenet_multi_nodeapi(&$node, $op, $a3 = NULL, $a4 = NULL) {
     switch ($op) {
     case 'load':
       // Add to node object
-      $result = db_query("SELECT nid,profile_id FROM {uc_authorizenet_multi} WHERE nid='%d'", $node->nid);
+      $result = db_query("SELECT nid,profile_id FROM {uc_authorizenet_multi} WHERE nid=%d", $node->nid);
       
       if ($row = db_fetch_object($result)) {
         $node->profile_id = $row->profile_id;
@@ -504,6 +499,9 @@ function uc_authorizenet_multi_nodeapi(&$node, $op, $a3 = NULL, $a4 = NULL) {
       $profile_id = $node->payment_gateway_profile;
       
       // update the reference in our database
+      //
+      // @todo: db_query results vary depending on database (ie. MySQL, PostgreSQL). 
+      // This module may not work on PostgreSQL. See http://drupal.org/node/1106004#comment-5105788 for details. 
       db_query("REPLACE INTO {uc_authorizenet_multi} (nid, profile_id) VALUES ('%d', '%d')", $node->nid,  $profile_id);
       
     break;
